@@ -1,0 +1,107 @@
+name: Cross-architecture Continuous Integrations
+
+on:
+  push:
+    branches: [ master, maxim ]
+    paths:
+      - '!**'
+      - '**.h'
+      - '**.cc'
+      - .github/workflows/ci-cross.yml
+  pull_request:
+    branches: [ master ]
+    paths:
+      - '!**'
+      - '**.h'
+      - '**.cc'
+      - .github/workflows/ci-cross.yml
+
+jobs:
+  unit-test:
+    name: ${{ matrix.arch }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Weakly-ordered, 128-byte cache line.
+          - arch: ppc64el
+            toolchain: g++-powerpc64le-linux-gnu
+            cxx: powerpc64le-linux-gnu-g++
+            qemu: qemu-ppc64le-static
+            boost_test: libboost-test-dev:ppc64el
+            sysroot: /
+          # Weakly-ordered, spin_loop_pause() is a hand-encoded PAUSE hint.
+          - arch: riscv64
+            toolchain: g++-riscv64-linux-gnu
+            cxx: riscv64-linux-gnu-g++
+            qemu: qemu-riscv64-static
+            boost_test: libboost-test-dev:riscv64
+            sysroot: /
+          # Big-endian, 256-byte cache line, no pause instruction.
+          - arch: s390x
+            toolchain: g++-s390x-linux-gnu
+            cxx: s390x-linux-gnu-g++
+            qemu: qemu-s390x-static
+            boost_test: libboost-test-dev:s390x
+            sysroot: /
+          # Ubuntu has no loong64 port, hence no Boost.Test and no unversioned
+          # cross-compiler package: the example only.
+          - arch: loong64
+            toolchain: g++-14-loongarch64-linux-gnu
+            cxx: loongarch64-linux-gnu-g++-14
+            qemu: qemu-loongarch64-static
+            boost_test: ''
+            sysroot: /usr/loongarch64-linux-gnu
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Enable ${{ matrix.arch }} packages
+      if: matrix.boost_test
+      run: |
+        # Restrict the pre-configured repositories to amd64, they carry no ${{ matrix.arch }} packages.
+        sudo sed -i '/^Types:/a Architectures: amd64' /etc/apt/sources.list.d/*.sources
+        for list in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
+            test -f "$list" || continue
+            sudo sed -i -e 's|^deb \[|deb [arch=amd64 |' -e 's|^deb \([^[]\)|deb [arch=amd64] \1|' "$list"
+        done
+        # ${{ matrix.arch }} packages live in the ports archive.
+        codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
+        sudo tee /etc/apt/sources.list.d/ports-${{ matrix.arch }}.sources >/dev/null <<EOF
+        Types: deb
+        URIs: http://ports.ubuntu.com/ubuntu-ports
+        Suites: $codename $codename-updates
+        Components: main universe
+        Architectures: ${{ matrix.arch }}
+        Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+        EOF
+        sudo dpkg --add-architecture ${{ matrix.arch }}
+
+    - name: Install the cross-toolchain, QEMU and Boost.Test
+      run: |
+        sudo apt-get update
+        sudo apt-get install --yes -qq --no-install-recommends \
+            ${{ matrix.toolchain }} qemu-user-static ${{ matrix.boost_test }}
+
+    - name: Toolset versions
+      run: |
+        ${{ matrix.cxx }} --version
+        ${{ matrix.qemu }} -version | head -1
+
+    - name: Build and run the example
+      run: |
+        ${{ matrix.cxx }} -std=c++14 -O2 -pthread -Wall -Wextra -Iinclude -Isrc \
+            src/example.cc -o example
+        file example
+        ${{ matrix.qemu }} -L ${{ matrix.sysroot }} ./example
+
+    - name: Build and run the unit-tests
+      if: matrix.boost_test
+      run: |
+        ${{ matrix.cxx }} -std=c++14 -O2 -pthread -Wall -Wextra -Iinclude -Isrc \
+            -DBOOST_TEST_DYN_LINK=1 src/tests.cc -o tests -lboost_unit_test_framework
+        file tests
+        ${{ matrix.qemu }} -L ${{ matrix.sysroot }} ./tests --log_level=unit_scope --report_level=short
